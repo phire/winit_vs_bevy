@@ -1,0 +1,31 @@
+[package]
+name = "winit_vs_bevy"
+version = "0.1.0"
+edition = "2024"
+authors = ["phiren@gmail.com"]
+description = "A quick benchmark to check CPU usage of raw winit+wgpu vs Bevy"
+license = "MIT"
+
+[dependencies]
+wgpu = "25.0"
+winit = "0.30"
+pollster = "0.3"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+
+[dependencies.bevy]
+version = "0.16"
+default-features = false
+features = [
+    "bevy_log",
+    "bevy_asset",
+    "bevy_render",
+    "bevy_winit",
+    "std",
+    "sysinfo_plugin",
+    # Note, enabling multi-threading does cause quite a bit of extra CPU usage.
+    #"multi_threaded",
+]
+
+[profile.release]
+debug = true
