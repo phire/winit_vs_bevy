@@ -96,11 +96,19 @@ fn run_raw_renderer() {
             }))
             .expect("Failed to find adapter");
 
+            println!(
+                "Using adapter: {} ({:?})",
+                adapter.get_info().name,
+                adapter.get_info().device_type
+            );
+
             // Request device and queue
             let (device, queue) = pollster::block_on(adapter.request_device(
                 &wgpu::DeviceDescriptor::default(),
             ))
             .expect("Failed to create device");
+
+
 
             // Configure the surface
             let surface_caps = surface.get_capabilities(&adapter);
