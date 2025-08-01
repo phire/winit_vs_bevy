@@ -1,3 +1,4 @@
+use bevy::winit::WinitSettings;
 use clap::{Parser, ValueEnum};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +18,8 @@ enum Renderer {
     Raw,
     /// Bevy 0.16 implementation
     Bevy,
+    /// eframe/egui implementation
+    Eframe,
 }
 
 fn main() {
@@ -28,6 +31,7 @@ fn main() {
             run_raw_renderer();
         }
         Renderer::Bevy => run_bevy_renderer(),
+        Renderer::Eframe => run_eframe_renderer(),
     }
 }
 
@@ -260,6 +264,7 @@ fn run_bevy_renderer() {
     println!("Running Bevy 0.16 renderer...");
 
     App::new()
+        .insert_resource(WinitSettings::desktop_app())
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
@@ -278,4 +283,64 @@ fn run_bevy_renderer() {
         ))
         .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)))
         .run();
+}
+
+fn run_eframe_renderer() {
+    use eframe::egui;
+    use std::time::Instant;
+
+    println!("Running eframe/egui renderer...");
+
+    struct EframeApp {
+        frame_count: u32,
+        last_fps_log: Instant,
+    }
+
+    impl Default for EframeApp {
+        fn default() -> Self {
+            Self {
+                frame_count: 0,
+                last_fps_log: Instant::now(),
+            }
+        }
+    }
+
+    impl eframe::App for EframeApp {
+        fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+            [0.1, 0.3, 0.2, 1.0] // set clear color
+        }
+
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+
+            // FPS tracking
+            self.frame_count += 1;
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_fps_log);
+
+            // Log FPS every 5 seconds
+            if elapsed.as_secs() >= 5 {
+                let fps = self.frame_count as f64 / elapsed.as_secs_f64();
+                println!("Eframe Renderer FPS: {:.2}", fps);
+                self.frame_count = 0;
+                self.last_fps_log = now;
+            }
+
+            // Request repaint to draw at every vsync
+            ctx.request_repaint();
+        }
+    }
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0])
+            .with_title("Eframe Blank Window"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Eframe Blank Window",
+        options,
+        Box::new(|_cc| Ok(Box::new(EframeApp::default()))),
+    ).expect("Failed to run eframe app");
 }
