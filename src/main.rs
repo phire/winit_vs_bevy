@@ -1,7 +1,39 @@
-use bevy::winit::WinitSettings;
+
 use clap::{Parser, ValueEnum};
 use std::sync::Arc;
 use std::time::Instant;
+
+// Unified FPS tracking
+struct FpsTracker {
+    frame_count: u32,
+    last_fps_log: Instant,
+    renderer_name: String,
+}
+
+impl FpsTracker {
+    fn new(renderer_name: &str) -> Self {
+        Self {
+            frame_count: 0,
+            last_fps_log: Instant::now(),
+            renderer_name: renderer_name.to_string(),
+        }
+    }
+
+    fn update(&mut self) {
+        self.frame_count += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_fps_log);
+
+        // Log FPS every 5 seconds
+        if elapsed.as_secs() >= 5 {
+            let fps = self.frame_count as f64 / elapsed.as_secs_f64();
+            println!("{} FPS: {:.2}", self.renderer_name, fps);
+            self.frame_count = 0;
+            self.last_fps_log = now;
+        }
+
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "winit_vs_bevy")]
@@ -54,9 +86,7 @@ fn run_raw_renderer() {
         queue: Option<wgpu::Queue>,
         surface: Option<wgpu::Surface<'static>>,
         surface_config: Option<wgpu::SurfaceConfiguration>,
-        // FPS tracking
-        frame_count: u32,
-        last_fps_log: Instant,
+        fps_tracker: FpsTracker,
     }
 
     impl Default for App {
@@ -67,8 +97,7 @@ fn run_raw_renderer() {
                 queue: None,
                 surface: None,
                 surface_config: None,
-                frame_count: 0,
-                last_fps_log: Instant::now(),
+                fps_tracker: FpsTracker::new("Raw Renderer"),
             }
         }
     }
@@ -228,20 +257,8 @@ fn run_raw_renderer() {
                 queue.submit(std::iter::once(encoder.finish()));
                 output.present();
 
-                // Not a great FPS counter, just here as a sanity check to make sure we are vsynced
-
                 // Update FPS tracking
-                self.frame_count += 1;
-                let now = Instant::now();
-                let elapsed = now.duration_since(self.last_fps_log);
-
-                // Log FPS every 5 seconds
-                if elapsed.as_secs() >= 5 {
-                    let fps = self.frame_count as f64 / elapsed.as_secs_f64();
-                    println!("Raw Renderer FPS: {:.2}", fps);
-                    self.frame_count = 0;
-                    self.last_fps_log = now;
-                }
+                self.fps_tracker.update();
 
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -262,51 +279,46 @@ fn run_raw_renderer() {
 
 fn run_bevy_renderer() {
     use bevy::prelude::*;
-    use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 
     println!("Running Bevy 0.16 renderer...");
 
+    #[derive(Resource)]
+    struct BevyFpsTracker(FpsTracker);
+
+    fn fps_tracking_system(mut fps_tracker: ResMut<BevyFpsTracker>) {
+        fps_tracker.0.update();
+    }
+
     App::new()
-        .insert_resource(WinitSettings::desktop_app())
-        .add_plugins((
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Bevy Blank Window".into(),
-                    resolution: (800.0, 600.0).into(),
-                    ..default()
-                }),
+        .insert_resource(BevyFpsTracker(FpsTracker::new("Bevy Renderer")))
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Bevy Blank Window".into(),
+                resolution: (800.0, 600.0).into(),
                 ..default()
             }),
-            FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin{
-                debug: false,
-                wait_duration: std::time::Duration::from_secs(5),
-                filter: None,
-            }
-        ))
+            ..default()
+        }))
+        .add_systems(Update, fps_tracking_system)
         .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)))
         .run();
 }
 
 fn run_eframe_renderer(use_wgpu: bool) {
     use eframe::egui;
-    use std::time::Instant;
 
     let backend_name = if use_wgpu { "with wgpu backend" } else { "" };
     println!("Running eframe/egui renderer {}...", backend_name);
 
     struct EframeApp {
-        frame_count: u32,
-        last_fps_log: Instant,
-        use_wgpu: bool,
+        fps_tracker: FpsTracker,
     }
 
     impl EframeApp {
         fn new(use_wgpu: bool) -> Self {
+            let backend = if use_wgpu { "WGPU" } else { "Glow" };
             Self {
-                frame_count: 0,
-                last_fps_log: Instant::now(),
-                use_wgpu,
+                fps_tracker: FpsTracker::new(&format!("Eframe {}", backend)),
             }
         }
     }
@@ -317,21 +329,8 @@ fn run_eframe_renderer(use_wgpu: bool) {
         }
 
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
-
             // FPS tracking
-            self.frame_count += 1;
-            let now = Instant::now();
-            let elapsed = now.duration_since(self.last_fps_log);
-
-            // Log FPS every 5 seconds
-            if elapsed.as_secs() >= 5 {
-                let fps = self.frame_count as f64 / elapsed.as_secs_f64();
-                let backend = if self.use_wgpu { "WGPU" } else { "Glow" };
-                println!("Eframe {} Renderer FPS: {:.2}", backend, fps);
-                self.frame_count = 0;
-                self.last_fps_log = now;
-            }
+            self.fps_tracker.update();
 
             // Request repaint to draw at every vsync
             ctx.request_repaint();
