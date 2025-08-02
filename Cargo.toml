@@ -12,7 +12,7 @@ winit = "0.30"
 pollster = "0.3"
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
-eframe = { version = "0.31", features = [] }
+eframe = { version = "0.31", features = ["glow", "wgpu"] }
 egui = "0.31"
 
 [dependencies.bevy]

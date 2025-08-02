@@ -18,8 +18,10 @@ enum Renderer {
     Raw,
     /// Bevy 0.16 implementation
     Bevy,
-    /// eframe/egui implementation
+    /// eframe/egui implementation (default backend)
     Eframe,
+    /// eframe/egui implementation with wgpu backend
+    EframeWgpu,
 }
 
 fn main() {
@@ -31,7 +33,8 @@ fn main() {
             run_raw_renderer();
         }
         Renderer::Bevy => run_bevy_renderer(),
-        Renderer::Eframe => run_eframe_renderer(),
+        Renderer::Eframe => run_eframe_renderer(false),
+        Renderer::EframeWgpu => run_eframe_renderer(true),
     }
 }
 
@@ -285,22 +288,25 @@ fn run_bevy_renderer() {
         .run();
 }
 
-fn run_eframe_renderer() {
+fn run_eframe_renderer(use_wgpu: bool) {
     use eframe::egui;
     use std::time::Instant;
 
-    println!("Running eframe/egui renderer...");
+    let backend_name = if use_wgpu { "with wgpu backend" } else { "" };
+    println!("Running eframe/egui renderer {}...", backend_name);
 
     struct EframeApp {
         frame_count: u32,
         last_fps_log: Instant,
+        use_wgpu: bool,
     }
 
-    impl Default for EframeApp {
-        fn default() -> Self {
+    impl EframeApp {
+        fn new(use_wgpu: bool) -> Self {
             Self {
                 frame_count: 0,
                 last_fps_log: Instant::now(),
+                use_wgpu,
             }
         }
     }
@@ -321,7 +327,8 @@ fn run_eframe_renderer() {
             // Log FPS every 5 seconds
             if elapsed.as_secs() >= 5 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
-                println!("Eframe Renderer FPS: {:.2}", fps);
+                let backend = if self.use_wgpu { "WGPU" } else { "Glow" };
+                println!("Eframe {} Renderer FPS: {:.2}", backend, fps);
                 self.frame_count = 0;
                 self.last_fps_log = now;
             }
@@ -331,16 +338,19 @@ fn run_eframe_renderer() {
         }
     }
 
+    let window_title = if use_wgpu { "Eframe WGPU Blank Window" } else { "Eframe Blank Window" };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
-            .with_title("Eframe Blank Window"),
+            .with_title(window_title),
+        renderer: if use_wgpu { eframe::Renderer::Wgpu } else { eframe::Renderer::Glow },
         ..Default::default()
     };
 
     eframe::run_native(
-        "Eframe Blank Window",
+        window_title,
         options,
-        Box::new(|_cc| Ok(Box::new(EframeApp::default()))),
+        Box::new(move |_cc| Ok(Box::new(EframeApp::new(use_wgpu)))),
     ).expect("Failed to run eframe app");
 }
