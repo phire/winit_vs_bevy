@@ -1,5 +1,6 @@
 
 use clap::{Parser, ValueEnum};
+use eframe::egui_wgpu::{self, WgpuConfiguration};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,6 +43,9 @@ struct Args {
     /// Renderer to use
     #[arg(short, long, default_value = "raw")]
     renderer: Renderer,
+    /// Disable vsync (vertical synchronization)
+    #[arg(long)]
+    no_vsync: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -62,15 +66,15 @@ fn main() {
     match args.renderer {
         Renderer::Raw => {
             env_logger::init();
-            run_raw_renderer();
+            run_raw_renderer(args.no_vsync);
         }
-        Renderer::Bevy => run_bevy_renderer(),
-        Renderer::Eframe => run_eframe_renderer(false),
-        Renderer::EframeWgpu => run_eframe_renderer(true),
+        Renderer::Bevy => run_bevy_renderer(args.no_vsync),
+        Renderer::Eframe => run_eframe_renderer(false, args.no_vsync),
+        Renderer::EframeWgpu => run_eframe_renderer(true, args.no_vsync),
     }
 }
 
-fn run_raw_renderer() {
+fn run_raw_renderer(no_vsync: bool) {
     use winit::{
         application::ApplicationHandler,
         event::WindowEvent,
@@ -87,10 +91,11 @@ fn run_raw_renderer() {
         surface: Option<wgpu::Surface<'static>>,
         surface_config: Option<wgpu::SurfaceConfiguration>,
         fps_tracker: FpsTracker,
+        no_vsync: bool,
     }
 
-    impl Default for App {
-        fn default() -> Self {
+    impl App {
+        fn new(no_vsync: bool) -> Self {
             Self {
                 window: None,
                 device: None,
@@ -98,7 +103,14 @@ fn run_raw_renderer() {
                 surface: None,
                 surface_config: None,
                 fps_tracker: FpsTracker::new("Raw Renderer"),
+                no_vsync,
             }
+        }
+    }
+
+    impl Default for App {
+        fn default() -> Self {
+            Self::new(false)
         }
     }
 
@@ -162,12 +174,17 @@ fn run_raw_renderer() {
 
 
             let size = window.inner_size();
+            let present_mode = if self.no_vsync {
+                wgpu::PresentMode::AutoNoVsync
+            } else {
+                wgpu::PresentMode::AutoVsync
+            };
             let config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: surface_format,
                 width: size.width,
                 height: size.height,
-                present_mode: wgpu::PresentMode::AutoVsync,
+                present_mode,
                 alpha_mode: surface_caps.alpha_modes[0],
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
@@ -270,14 +287,14 @@ fn run_raw_renderer() {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    let mut app = App::new(no_vsync);
 
     event_loop
         .run_app(&mut app)
         .expect("Failed to run event loop");
 }
 
-fn run_bevy_renderer() {
+fn run_bevy_renderer(no_vsync: bool) {
     use bevy::prelude::*;
 
     println!("Running Bevy 0.16 renderer...");
@@ -289,12 +306,19 @@ fn run_bevy_renderer() {
         fps_tracker.0.update();
     }
 
+    let present_mode = if no_vsync {
+        bevy::window::PresentMode::Immediate
+    } else {
+        bevy::window::PresentMode::AutoVsync
+    };
+
     App::new()
         .insert_resource(BevyFpsTracker(FpsTracker::new("Bevy Renderer")))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Bevy Blank Window".into(),
                 resolution: (800.0, 600.0).into(),
+                present_mode,
                 ..default()
             }),
             ..default()
@@ -304,7 +328,7 @@ fn run_bevy_renderer() {
         .run();
 }
 
-fn run_eframe_renderer(use_wgpu: bool) {
+fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
     use eframe::egui;
 
     let backend_name = if use_wgpu { "with wgpu backend" } else { "" };
@@ -332,7 +356,7 @@ fn run_eframe_renderer(use_wgpu: bool) {
             // FPS tracking
             self.fps_tracker.update();
 
-            // Request repaint to draw at every vsync
+            // Request repaint
             ctx.request_repaint();
         }
     }
@@ -344,6 +368,15 @@ fn run_eframe_renderer(use_wgpu: bool) {
             .with_inner_size([800.0, 600.0])
             .with_title(window_title),
         renderer: if use_wgpu { eframe::Renderer::Wgpu } else { eframe::Renderer::Glow },
+        vsync: !no_vsync, // Only used by Glow.
+        wgpu_options: WgpuConfiguration {
+            present_mode: if no_vsync {
+                eframe::wgpu::PresentMode::AutoNoVsync
+            } else {
+                eframe::wgpu::PresentMode::AutoVsync
+            },
+            ..Default::default()
+        },
         ..Default::default()
     };
 
