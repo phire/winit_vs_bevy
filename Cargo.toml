@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 wgpu = "25.0"
 winit = "0.30"
+raw-window-handle = "0.6.2"
 pollster = "0.3"
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
@@ -28,6 +29,19 @@ features = [
     # Note, enabling multi-threading does cause quite a bit of extra CPU usage.
     #"multi_threaded",
 ]
+
+# mac-only deps for direct metal rendering
+[target.'cfg(target_os = "macos")'.dependencies]
+#cocoa = "0.26"
+#metal = "0.32"
+objc2 = "0.6.0"
+objc2-app-kit = "0.3.1"
+objc2-metal = "0.3.1"
+objc2-metal-kit = "0.3.1"
+objc2-foundation = "0.3.1"
+dispatch2 = "0.3.0"
+block2 = "0.6.1"
+
 
 [profile.release]
 debug = true

@@ -1,6 +1,6 @@
 
 use clap::{Parser, ValueEnum};
-use eframe::egui_wgpu::{self, WgpuConfiguration};
+use eframe::egui_wgpu::WgpuConfiguration;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -58,6 +58,9 @@ enum Renderer {
     Eframe,
     /// eframe/egui implementation with wgpu backend
     EframeWgpu,
+    /// Direct Metal implementation (macOS only)
+    #[cfg(target_os = "macos")]
+    Metal,
 }
 
 fn main() {
@@ -71,6 +74,8 @@ fn main() {
         Renderer::Bevy => run_bevy_renderer(args.no_vsync),
         Renderer::Eframe => run_eframe_renderer(false, args.no_vsync),
         Renderer::EframeWgpu => run_eframe_renderer(true, args.no_vsync),
+        #[cfg(target_os = "macos")]
+        Renderer::Metal => run_metal_renderer(args.no_vsync),
     }
 }
 
@@ -327,6 +332,185 @@ fn run_bevy_renderer(no_vsync: bool) {
         .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)))
         .run();
 }
+
+#[cfg(target_os = "macos")]
+fn run_metal_renderer(no_vsync: bool) {
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+
+    use objc2_metal::*;
+    use objc2_metal_kit::*;
+    use objc2::MainThreadOnly;
+
+    use winit::{
+        application::ApplicationHandler,
+        event::WindowEvent,
+        event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+        window::{Window, WindowId},
+    };
+    //use objc2_foundation::geometry::{CGPoint, CGRect, CGSize};
+
+    use block2::RcBlock;
+
+    println!("Running direct Metal renderer...");
+
+    struct MetalApp {
+        window: Option<Arc<Window>>,
+        device: Option<Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>>,
+        view: Option<Retained<MTKView>>,
+        command_queue: Option<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
+        semaphore: dispatch2::DispatchRetained<dispatch2::DispatchSemaphore>,
+        fps_tracker: FpsTracker,
+    }
+
+    impl ApplicationHandler for MetalApp {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            let mtm = MainThreadMarker::new().expect("Not running on main thread");
+            use objc2::MainThreadMarker;
+
+            let window_attributes = Window::default_attributes()
+                .with_title("Direct Metal Blank Window")
+                .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
+
+            let window = Arc::new(
+                event_loop
+                    .create_window(window_attributes)
+                    .expect("Failed to create window")
+            );
+
+            let view = {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+                let Ok(RawWindowHandle::AppKit(rw)) = window.window_handle().map(|wh| wh.as_raw()) else {
+                    panic!("Failed to get AppKit view from window handle");
+                };
+
+                let view = rw.ns_view.as_ptr();
+                let view: Retained<objc2_app_kit::NSView> = unsafe { Retained::retain(view.cast()) }.unwrap();
+
+                view
+            };
+            let ns_window = view.window().expect("view not in a window");
+
+            // Initialize Metal
+
+            let device =  objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device found");
+            println!("Using Metal device: {}", device.name());
+
+            let command_queue = device.newCommandQueue().expect("failed to create command queue");
+
+            let mtk_view = {
+                let frame = ns_window.frame();
+                unsafe { MTKView::initWithFrame_device(MTKView::alloc(mtm), frame, Some(&device)) }
+            };
+            ns_window.setContentView(Some(&mtk_view));
+
+            unsafe {
+                mtk_view.setClearColor(MTLClearColor { red: 0.1, green: 0.2, blue: 0.2, alpha: 1.0 });
+            }
+
+            self.window = Some(window);
+            self.device = Some(device);
+            self.view = Some(mtk_view);
+            self.command_queue = Some(command_queue);
+        }
+
+        fn window_event(
+            &mut self,
+            event_loop: &ActiveEventLoop,
+            _window_id: WindowId,
+            event: WindowEvent,
+        ) {
+            match event {
+                WindowEvent::CloseRequested => { event_loop.exit(); }
+                WindowEvent::RedrawRequested => { }
+                WindowEvent::Resized(physical_size) => {
+                    if let Some(mtk_view) = &self.view {
+                        unsafe {
+                            use objc2_foundation::NSSize;
+
+                            mtk_view.setFrameSize(NSSize::new(
+                                physical_size.width as f64,
+                                physical_size.height as f64,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn new_events(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _cause: winit::event::StartCause) {
+
+
+
+
+
+            // Now pull all the events. winit will then continue in about_to_wait.
+        }
+
+        fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+            // This runs when the event loop is ready to process events. Make sure we are synced.
+            if self.semaphore.wait(dispatch2::DispatchTime::FOREVER) != 0 {
+                panic!("Failed to wait on semaphore");
+            }
+
+            // Update FPS tracking
+            self.fps_tracker.update();
+
+            let (Some(view), Some(command_queue)) = (&self.view, &self.command_queue) else {
+                return;
+            };
+
+            let Some(render_pass_descriptor) = (unsafe { view.currentRenderPassDescriptor() }) else {
+                println!("No render pass descriptor available");
+                return;
+            };
+
+
+            // Create command buffer and encoder
+            let command_buffer = command_queue.commandBuffer().expect("Failed to create command buffer");
+            let encoder = command_buffer.renderCommandEncoderWithDescriptor(&render_pass_descriptor).unwrap();
+
+            // Register a completion handler to signal the semaphore when done
+            let semaphore = self.semaphore.clone();
+            let block = RcBlock::new(move |_| {
+                semaphore.signal();
+            });
+
+
+            unsafe { command_buffer.addCompletedHandler(RcBlock::into_raw(block)) }
+
+            encoder.endEncoding();
+
+            // Present the drawable and commit
+
+            // Try to get a drawable from the Metal layer
+            if let Some(drawable) = unsafe { view.currentDrawable() } {
+                command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            } else {
+                panic!("Failed to get current drawable");
+            }
+            command_buffer.commit();
+
+        }
+    }
+
+    let mut app =  MetalApp {
+        window: None,
+        device: None,
+        view: None,
+        command_queue: None,
+        semaphore: dispatch2::DispatchSemaphore::new(1),
+        fps_tracker: FpsTracker::new("Metal Renderer"),
+    };
+
+
+    let event_loop = EventLoop::new().expect("Failed to create event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    event_loop.run_app(&mut app).expect("Failed to run event loop");
+}
+
 
 fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
     use eframe::egui;
