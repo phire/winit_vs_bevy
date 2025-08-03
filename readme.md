@@ -18,18 +18,28 @@ This example is designed to be a more fair comparison, using wgpu to actually re
 
 To test winit+wgpu, launch with: `cargo run -r -- -r raw`. To test bevy, launch with: `cargo run -r -- -r bevy`.
 
+Then I went a bit overboard and added few more renderers:
+
+ * `eframe` - with default glow backend. 
+ * `eframe-wgpu` - with wgpu backend.
+ * `metal` - using objc2 directly. Doesn't even use winit
+
 ## Results
 
 In my quick testing on my M1-Max:
 (window focused, no mouse movement, wait for usage in Activity Monitor to stabilize)
 
- * Raw winit+wgpu: 15.5% CPU
- * Bevy: 18.3% CPU
+ * metal (rust implementation, no winit): 12% CPU
+ * eframe (opengl): 13% CPU
+ * (not included) xcode swift metal: 14% CPU
+ * raw winit+wgpu: 15% CPU
+ * eframe-wgpu: 16% CPU
+ * bevy: 18% CPU
 
 IMO, this is close enough that they might as well be identical. 
-If anything, the fact Bevy is only using 3% more CPU time is surprising because it's doing way more work under the hood (extracting entities from the world, building scene graphs) before even submitting a blank frame, and then somehow managing to trigger two 128KB resource allocations per frame.
+If anything, the fact Bevy is only using 3% more CPU time than raw surprising because it's doing way more work under the hood (extracting entities from the world, building scene graphs) before even submitting a blank frame, and then somehow managing to trigger two 128KB resource allocations per frame.
 
-The raw gpu+winit has zero allocations and is hardcoded to always directly submit a blank frame.
+The raw gpu+winit backend has zero allocations and is hardcoded to always directly submit a blank frame.
 
 ## Notes
 
@@ -37,6 +47,8 @@ This example explicitly avoids the bevy `multi_threaded` feature. Partly because
 
 When the multi_threaded feature is enabled, the CPU usage on my machine is more like 32%. If you are
 concerned about "CPU usage", then consider disabling it. Though, I doubt this extra CPU usage translates into a real world performance difference, especially with a more complex scene.
+wgpu does appear to have a bit of overhead itself. Both eframe's opengl backend and native
+metal use notably less CPU time.
 
 ## Key takeaway:
 
