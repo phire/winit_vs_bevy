@@ -35,6 +35,22 @@ impl FpsTracker {
     }
 }
 
+// Unified options struct for all renderers
+#[derive(Clone)]
+struct RendererOptions {
+    pub no_vsync: bool,
+    pub triangle: bool,
+}
+
+impl From<Args> for RendererOptions {
+    fn from(args: Args) -> Self {
+        Self {
+            no_vsync: args.no_vsync,
+            triangle: args.triangle,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "winit_vs_bevy")]
 #[command(about = "A comparison between custom wgpu+winit and Bevy rendering")]
@@ -45,6 +61,9 @@ struct Args {
     /// Disable vsync (vertical synchronization)
     #[arg(long)]
     no_vsync: bool,
+    /// Render triangles instead of blank screen
+    #[arg(long)]
+    triangle: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -64,27 +83,53 @@ enum Renderer {
 
 fn main() {
     let args = Args::parse();
+    let renderer = args.renderer.clone();
+    let options = RendererOptions::from(args);
 
-    match args.renderer {
+    match renderer {
         Renderer::Raw => {
             env_logger::init();
-            run_raw_renderer(args.no_vsync);
+            run_raw_renderer(&options);
         }
-        Renderer::Bevy => run_bevy_renderer(args.no_vsync),
-        Renderer::Eframe => run_eframe_renderer(false, args.no_vsync),
-        Renderer::EframeWgpu => run_eframe_renderer(true, args.no_vsync),
+        Renderer::Bevy => run_bevy_renderer(&options),
+        Renderer::Eframe => run_eframe_renderer(false, &options),
+        Renderer::EframeWgpu => run_eframe_renderer(true, &options),
         #[cfg(target_os = "macos")]
-        Renderer::Metal => run_metal_renderer(args.no_vsync),
+        Renderer::Metal => run_metal_renderer(&options),
     }
 }
 
-fn run_raw_renderer(no_vsync: bool) {
+fn run_raw_renderer(options: &RendererOptions) {
     use winit::{
         application::ApplicationHandler,
         event::WindowEvent,
         event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
         window::{Window, WindowId},
     };
+
+    // Unified structs for 3D rendering
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct Vertex {
+        position: [f32; 3],
+        normal: [f32; 3],
+    }
+
+    unsafe impl bytemuck::Pod for Vertex {}
+    unsafe impl bytemuck::Zeroable for Vertex {}
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    struct Uniforms {
+        view_proj: [[f32; 4]; 4],
+        light_position: [f32; 3],
+        _padding: f32,
+        light_color: [f32; 3],
+        _padding2: f32,
+    }
+
+    unsafe impl bytemuck::Pod for Uniforms {}
+    unsafe impl bytemuck::Zeroable for Uniforms {}
 
     println!("Running raw wgpu+winit renderer...");
 
@@ -94,27 +139,38 @@ fn run_raw_renderer(no_vsync: bool) {
         queue: Option<wgpu::Queue>,
         surface: Option<wgpu::Surface<'static>>,
         surface_config: Option<wgpu::SurfaceConfiguration>,
+        render_pipeline: Option<wgpu::RenderPipeline>,
+        vertex_buffer: Option<wgpu::Buffer>,
+        uniform_buffer: Option<wgpu::Buffer>,
+        bind_group: Option<wgpu::BindGroup>,
         fps_tracker: FpsTracker,
-        no_vsync: bool,
+        options: RendererOptions,
     }
 
     impl App {
-        fn new(no_vsync: bool) -> Self {
+        fn new(options: RendererOptions) -> Self {
             Self {
                 window: None,
                 device: None,
                 queue: None,
                 surface: None,
                 surface_config: None,
+                render_pipeline: None,
+                vertex_buffer: None,
+                uniform_buffer: None,
+                bind_group: None,
                 fps_tracker: FpsTracker::new("Raw Renderer"),
-                no_vsync,
+                options,
             }
         }
     }
 
     impl Default for App {
         fn default() -> Self {
-            Self::new(false)
+            Self::new(RendererOptions {
+                no_vsync: false,
+                triangle: false,
+            })
         }
     }
 
@@ -178,7 +234,7 @@ fn run_raw_renderer(no_vsync: bool) {
 
 
             let size = window.inner_size();
-            let present_mode = if self.no_vsync {
+            let present_mode = if self.options.no_vsync {
                 wgpu::PresentMode::AutoNoVsync
             } else {
                 wgpu::PresentMode::AutoVsync
@@ -196,11 +252,225 @@ fn run_raw_renderer(no_vsync: bool) {
 
             surface.configure(&device, &config);
 
+            // Create triangle pipeline and vertex buffer if requested
+            let (render_pipeline, vertex_buffer, uniform_buffer, bind_group) = if self.options.triangle {
+                impl Vertex {
+                    fn desc() -> wgpu::VertexBufferLayout<'static> {
+                        wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &[
+                                wgpu::VertexAttribute {
+                                    offset: 0,
+                                    shader_location: 0,
+                                    format: wgpu::VertexFormat::Float32x3,
+                                },
+                                wgpu::VertexAttribute {
+                                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                                    shader_location: 1,
+                                    format: wgpu::VertexFormat::Float32x3,
+                                },
+                            ],
+                        }
+                    }
+                }
+
+                // Triangle vertices matching Bevy's triangle
+                let vertices = [
+                    Vertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+                    Vertex { position: [-1.0, -1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+                    Vertex { position: [1.0, -1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+                ];
+
+                let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Vertex Buffer"),
+                    size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+                // Create view and projection matrices using cgmath (matching Bevy's camera setup)
+                let eye = cgmath::Point3::new(0.0, 0.0, 9.0);
+                let target = cgmath::Point3::new(0.0, 0.0, 0.0);
+                let up = cgmath::Vector3::unit_y();
+
+                let view = cgmath::Matrix4::look_at_rh(eye, target, up);
+                let projection = cgmath::perspective(
+                    cgmath::Deg(45.0),
+                    size.width as f32 / size.height as f32,
+                    0.1,
+                    100.0
+                );
+
+                let view_proj = projection * view;
+
+                let uniforms = Uniforms {
+                    view_proj: view_proj.into(),
+                    light_position: [4.0, 8.0, 4.0], // Matching Bevy's light position
+                    _padding: 0.0,
+                    light_color: [1.0, 1.0, 1.0],
+                    _padding2: 0.0,
+                };
+
+                let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Uniform Buffer"),
+                    size: std::mem::size_of::<Uniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+                // Create bind group layout
+                let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                    label: Some("uniform_bind_group_layout"),
+                });
+
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    }],
+                    label: Some("uniform_bind_group"),
+                });
+
+                // Enhanced vertex shader with 3D transformations and lighting
+                let vs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Vertex Shader"),
+                    source: wgpu::ShaderSource::Wgsl(r#"
+                        struct Uniforms {
+                            view_proj: mat4x4<f32>,
+                            light_position: vec3<f32>,
+                            light_color: vec3<f32>,
+                        }
+                        @group(0) @binding(0)
+                        var<uniform> uniforms: Uniforms;
+
+                        struct VertexInput {
+                            @location(0) position: vec3<f32>,
+                            @location(1) normal: vec3<f32>,
+                        }
+
+                        struct VertexOutput {
+                            @builtin(position) clip_position: vec4<f32>,
+                            @location(0) world_position: vec3<f32>,
+                            @location(1) normal: vec3<f32>,
+                        }
+
+                        @vertex
+                        fn vs_main(model: VertexInput) -> VertexOutput {
+                            var out: VertexOutput;
+                            out.world_position = model.position;
+                            out.normal = model.normal;
+                            out.clip_position = uniforms.view_proj * vec4<f32>(model.position, 1.0);
+                            return out;
+                        }
+                    "#.into()),
+                });
+
+                // Enhanced fragment shader with Phong lighting
+                let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Fragment Shader"),
+                    source: wgpu::ShaderSource::Wgsl(r#"
+                        struct Uniforms {
+                            view_proj: mat4x4<f32>,
+                            light_position: vec3<f32>,
+                            light_color: vec3<f32>,
+                        }
+                        @group(0) @binding(0)
+                        var<uniform> uniforms: Uniforms;
+
+                        struct VertexOutput {
+                            @builtin(position) clip_position: vec4<f32>,
+                            @location(0) world_position: vec3<f32>,
+                            @location(1) normal: vec3<f32>,
+                        }
+
+                        @fragment
+                        fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                            let material_color = vec3<f32>(1.0, 1.0, 1.0);
+                            let ambient = vec3<f32>(0.1, 0.1, 0.1);
+
+                            let light_dir = normalize(uniforms.light_position - in.world_position);
+                            let normal = normalize(in.normal);
+
+                            let diffuse = max(dot(normal, light_dir), 0.0) * uniforms.light_color;
+
+                            let final_color = material_color * (ambient + diffuse);
+                            return vec4<f32>(final_color, 1.0);
+                        }
+                    "#.into()),
+                });
+
+                let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Render Pipeline"),
+                    layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Render Pipeline Layout"),
+                        bind_group_layouts: &[&bind_group_layout],
+                        push_constant_ranges: &[],
+                    })),
+                    vertex: wgpu::VertexState {
+                        module: &vs_module,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Vertex::desc()],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &fs_module,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview: None,
+                    cache: None,
+                });
+
+                (Some(render_pipeline), Some(vertex_buffer), Some(uniform_buffer), Some(bind_group))
+            } else {
+                (None, None, None, None)
+            };
+
             self.window = Some(window);
             self.device = Some(device);
             self.queue = Some(queue);
             self.surface = Some(surface);
             self.surface_config = Some(config);
+            self.render_pipeline = render_pipeline;
+            self.vertex_buffer = vertex_buffer;
+            self.uniform_buffer = uniform_buffer;
+            self.bind_group = bind_group;
         }
 
         fn window_event(
@@ -254,7 +524,7 @@ fn run_raw_renderer(no_vsync: bool) {
 
                 // Simply starting a render pass triggers a clear operation.
                 {
-                    let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Render Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &view,
@@ -273,6 +543,58 @@ fn run_raw_renderer(no_vsync: bool) {
                         occlusion_query_set: None,
                         timestamp_writes: None,
                     });
+
+                    // Draw triangle if enabled
+                    if let (Some(pipeline), Some(vertex_buffer), Some(bind_group), Some(uniform_buffer)) =
+                        (&self.render_pipeline, &self.vertex_buffer, &self.bind_group, &self.uniform_buffer) {
+
+                        // Update uniforms every frame (even if static) to match Bevy's behavior
+                        let size = self.surface_config.as_ref().unwrap();
+
+                        #[repr(C)]
+                        #[derive(Copy, Clone, Debug)]
+                        struct Uniforms {
+                            view_proj: [[f32; 4]; 4],
+                            light_position: [f32; 3],
+                            _padding: f32,
+                            light_color: [f32; 3],
+                            _padding2: f32,
+                        }
+
+                        unsafe impl bytemuck::Pod for Uniforms {}
+                        unsafe impl bytemuck::Zeroable for Uniforms {}
+
+                        // Recreate matrices every frame (even though they're static)
+                        let eye = cgmath::Point3::new(0.0, 0.0, 9.0);
+                        let target = cgmath::Point3::new(0.0, 0.0, 0.0);
+                        let up = cgmath::Vector3::unit_y();
+
+                        let view = cgmath::Matrix4::look_at_rh(eye, target, up);
+                        let projection = cgmath::perspective(
+                            cgmath::Deg(45.0),
+                            size.width as f32 / size.height as f32,
+                            0.1,
+                            100.0
+                        );
+
+                        let view_proj = projection * view;
+
+                        let uniforms = Uniforms {
+                            view_proj: view_proj.into(),
+                            light_position: [4.0, 8.0, 4.0],
+                            _padding: 0.0,
+                            light_color: [1.0, 1.0, 1.0],
+                            _padding2: 0.0,
+                        };
+
+                        // Upload uniforms every frame
+                        queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+                        render_pass.set_pipeline(pipeline);
+                        render_pass.set_bind_group(0, bind_group, &[]);
+                        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                        render_pass.draw(0..3, 0..1);
+                    }
                 }
 
                 queue.submit(std::iter::once(encoder.finish()));
@@ -291,17 +613,17 @@ fn run_raw_renderer(no_vsync: bool) {
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(no_vsync);
+    let mut app = App::new(options.clone());
 
     event_loop
         .run_app(&mut app)
         .expect("Failed to run event loop");
 }
 
-fn run_bevy_renderer(no_vsync: bool) {
+fn run_bevy_renderer(options: &RendererOptions) {
     use bevy::prelude::*;
     use bevy::render::RenderApp;
-
+    use bevy::window::PresentMode;
 
     println!("Running Bevy 0.16 renderer...");
 
@@ -312,30 +634,39 @@ fn run_bevy_renderer(no_vsync: bool) {
         fps_tracker.0.update();
     }
 
-    let present_mode = if no_vsync {
-        bevy::window::PresentMode::Immediate
-    } else {
-        bevy::window::PresentMode::AutoVsync
-    };
-
     fn setup(
         mut commands: Commands,
         mut meshes: ResMut<Assets<Mesh>>,
-        mut materials: ResMut<Assets<ColorMaterial>>,
+        mut materials: ResMut<Assets<StandardMaterial>>,
     ) {
-        commands.spawn(Camera2d);
+        commands.spawn((
+            Camera3d::default(),
+            Transform::from_xyz(0.0, 0.0, 9.0).looking_at(Vec3::ZERO, Vec3::Y),
 
-        let triangle = meshes.add(Triangle2d::new(
-            Vec2::new(0.0, 200.0),
-            Vec2::new(-200.0, -200.0),
-            Vec2::new(200.0, -200.0),
         ));
 
         commands.spawn((
-            Mesh2d(triangle),
-            MeshMaterial2d(materials.add( Color::WHITE)),
-            Transform::from_xyz(0.0, 0.0, 0.0),
+            PointLight {
+                shadows_enabled: true,
+                ..default()
+            },
+            Transform::from_xyz(4.0, 8.0, 4.0),
         ));
+
+        for i in 0..1 {
+            let triangle = meshes.add(Triangle3d::new(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+            ));
+            commands.spawn((
+                Mesh3d(triangle),
+                MeshMaterial3d(materials.add( Color::WHITE)),
+                Transform::from_xyz(0.0, -0.1 * i as f32, -0.1 * i as f32),
+            ));
+        }
+
+
     }
 
     let mut app = App::new();
@@ -345,13 +676,16 @@ fn run_bevy_renderer(no_vsync: bool) {
             primary_window: Some(Window {
                 title: "Bevy Blank Window".into(),
                 resolution: (800.0, 600.0).into(),
-                present_mode,
+                present_mode: if options.no_vsync { PresentMode::AutoNoVsync } else { PresentMode::AutoVsync },
                 ..default()
             }),
             ..default()
         }))
-        .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)));
+
+    if options.triangle {
+        app.add_systems(Startup, setup);
+    }
 
     let render_app = (&mut app).get_sub_app_mut(RenderApp).expect("RenderApp not found");
 
@@ -364,7 +698,14 @@ fn run_bevy_renderer(no_vsync: bool) {
 }
 
 #[cfg(target_os = "macos")]
-fn run_metal_renderer(_no_vsync: bool) {
+fn run_metal_renderer(options: &RendererOptions) {
+    // Check for unsupported options
+    if options.triangle {
+        eprintln!("Error: Triangle rendering is not yet implemented for the Metal renderer");
+        eprintln!("Try using --renderer raw or --renderer bevy instead");
+        std::process::exit(1);
+    }
+
     // Roughly based on the example from https://docs.rs/objc2-metal/0.3.1/objc2_metal/index.html
     // Adjusted to match xcode's game template
     use core::cell::OnceCell;
@@ -387,6 +728,7 @@ fn run_metal_renderer(_no_vsync: bool) {
         command_queue: OnceCell<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
         semaphore: OnceCell<DispatchRetained<DispatchSemaphore>>,
         fps_tracker: RefCell<FpsTracker>,
+        options: RendererOptions,
     }
 
     define_class!(
@@ -521,7 +863,7 @@ fn run_metal_renderer(_no_vsync: bool) {
     );
 
     impl Delegate {
-        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        fn new(mtm: MainThreadMarker, options: RendererOptions) -> Retained<Self> {
             let this = Self::alloc(mtm);
 
             let fps_tracker = RefCell::new(FpsTracker::new("Metal Renderer"));
@@ -530,6 +872,7 @@ fn run_metal_renderer(_no_vsync: bool) {
                 command_queue: Default::default(),
                 semaphore: Default::default(),
                 fps_tracker,
+                options,
             });
             unsafe { msg_send![super(this), init] }
         }
@@ -541,7 +884,7 @@ fn run_metal_renderer(_no_vsync: bool) {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
     // attach our delegate
-    let delegate = Delegate::new(mtm);
+    let delegate = Delegate::new(mtm, options.clone());
     let object = ProtocolObject::from_ref(&*delegate);
     app.setDelegate(Some(object));
 
@@ -550,10 +893,16 @@ fn run_metal_renderer(_no_vsync: bool) {
 }
 
 
-fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
+fn run_eframe_renderer(use_wgpu: bool, options: &RendererOptions) {
     use eframe::egui;
     use eframe::egui_wgpu::WgpuConfiguration;
 
+    // Check for unsupported options
+    if options.triangle {
+        eprintln!("Error: Triangle rendering is not supported by the eframe/egui renderer");
+        eprintln!("Try using --renderer raw or --renderer bevy instead");
+        std::process::exit(1);
+    }
 
     let backend_name = if use_wgpu { "with wgpu backend" } else { "" };
     println!("Running eframe/egui renderer {}...", backend_name);
@@ -573,7 +922,7 @@ fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
 
     impl eframe::App for EframeApp {
         fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-            [0.1, 0.3, 0.2, 1.0] // set clear color
+            [0.1, 0.2, 0.3, 1.0] // set clear color
         }
 
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -587,14 +936,14 @@ fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
 
     let window_title = if use_wgpu { "Eframe WGPU Blank Window" } else { "Eframe Blank Window" };
 
-    let options = eframe::NativeOptions {
+    let eframe_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_title(window_title),
         renderer: if use_wgpu { eframe::Renderer::Wgpu } else { eframe::Renderer::Glow },
-        vsync: !no_vsync, // Only used by Glow.
+        vsync: !options.no_vsync, // Only used by Glow.
         wgpu_options: WgpuConfiguration {
-            present_mode: if no_vsync {
+            present_mode: if options.no_vsync {
                 eframe::wgpu::PresentMode::AutoNoVsync
             } else {
                 eframe::wgpu::PresentMode::AutoVsync
@@ -606,7 +955,7 @@ fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
 
     eframe::run_native(
         window_title,
-        options,
+        eframe_options,
         Box::new(move |_cc| Ok(Box::new(EframeApp::new(use_wgpu)))),
     ).expect("Failed to run eframe app");
 }
