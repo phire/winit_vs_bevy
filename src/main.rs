@@ -699,13 +699,6 @@ fn run_bevy_renderer(options: &RendererOptions) {
 
 #[cfg(target_os = "macos")]
 fn run_metal_renderer(options: &RendererOptions) {
-    // Check for unsupported options
-    if options.triangle {
-        eprintln!("Error: Triangle rendering is not yet implemented for the Metal renderer");
-        eprintln!("Try using --renderer raw or --renderer bevy instead");
-        std::process::exit(1);
-    }
-
     // Roughly based on the example from https://docs.rs/objc2-metal/0.3.1/objc2_metal/index.html
     // Adjusted to match xcode's game template
     use core::cell::OnceCell;
@@ -723,12 +716,29 @@ fn run_metal_renderer(options: &RendererOptions) {
 
     println!("Running direct Metal renderer...");
 
+    const FRAMES_IN_FLIGHT: usize = 3;
+
     struct Ivars {
         window: OnceCell<Retained<NSWindow>>,
         command_queue: OnceCell<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
         semaphore: OnceCell<DispatchRetained<DispatchSemaphore>>,
         fps_tracker: RefCell<FpsTracker>,
         options: RendererOptions,
+        render_pipeline_state: OnceCell<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+        vertex_buffer: OnceCell<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        uniform_buffer: OnceCell<Retained<ProtocolObject<dyn MTLBuffer>>>,
+        uniform_buffer_index: RefCell<usize>,
+    }
+
+    // Uniforms struct matching other renderers
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Uniforms {
+        view_proj: [[f32; 4]; 4],
+        light_position: [f32; 3],
+        _padding: f32,
+        light_color: [f32; 3],
+        _padding2: f32,
     }
 
     define_class!(
@@ -796,7 +806,12 @@ fn run_metal_renderer(options: &RendererOptions) {
                 unsafe { mtk_view.setPreferredFramesPerSecond(120); }
 
                 // Set a custom clear color
-                unsafe { mtk_view.setClearColor(MTLClearColor { red: 0.1, green: 0.2, blue: 0.2, alpha: 1.0 }); }
+                unsafe { mtk_view.setClearColor(MTLClearColor { red: 0.1, green: 0.2, blue: 0.3, alpha: 1.0 }); }
+
+                // Initialize triangle resources if needed
+                if self.ivars().options.triangle {
+                    self.initialize_triangle_resources(&device, &mtk_view);
+                }
 
                 // finish setting up the window
                 window.setContentView(Some(&mtk_view));
@@ -823,10 +838,45 @@ fn run_metal_renderer(options: &RendererOptions) {
                 let semaphore = self.ivars().semaphore.get().unwrap();
                 let command_queue = self.ivars().command_queue.get().unwrap();
 
+                let mut uniform_buffer_index = self.ivars().uniform_buffer_index.borrow_mut();
+
+                let triangle = self.ivars().options.triangle;
+
                 semaphore.wait(DispatchTime::FOREVER);
 
                 // Update FPS tracking
                 self.ivars().fps_tracker.borrow_mut().update();
+
+                let uniform_buffer_offset = size_of::<Uniforms>() * *uniform_buffer_index;
+                if triangle {
+                    let uniform_buffer = self.ivars().uniform_buffer.get().unwrap();
+                    *uniform_buffer_index = (*uniform_buffer_index + 1) % FRAMES_IN_FLIGHT;
+
+                    // Calculate matrices using cgmath (matching other renderers)
+                    let bounds = mtk_view.bounds();
+                    let aspect = bounds.size.width as f32 / bounds.size.height as f32;
+
+                    let eye = cgmath::Point3::new(0.0, 0.0, 9.0);
+                    let target = cgmath::Point3::new(0.0, 0.0, 0.0);
+                    let up = cgmath::Vector3::unit_y();
+
+                    let view = cgmath::Matrix4::look_at_rh(eye, target, up);
+                    let projection = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+                    let view_proj = projection * view;
+
+                    let uniforms = Uniforms {
+                        view_proj: view_proj.into(),
+                        light_position: [4.0, 8.0, 4.0],
+                        _padding: 0.0,
+                        light_color: [1.0, 1.0, 1.0],
+                        _padding2: 0.0,
+                    };
+
+                    unsafe {
+                        let buffer = uniform_buffer.contents().as_ptr().add(uniform_buffer_offset) as *mut Uniforms;
+                        std::ptr::write(buffer, uniforms);
+                    }
+                }
 
                 let Some(pass_descriptor) = (unsafe { mtk_view.currentRenderPassDescriptor() }) else {
                     println!("No render pass available");
@@ -845,6 +895,21 @@ fn run_metal_renderer(options: &RendererOptions) {
                 let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&pass_descriptor) else {
                     return;
                 };
+
+                // Render triangle if enabled
+                if self.ivars().options.triangle {
+                    let pipeline_state = self.ivars().render_pipeline_state.get().unwrap();
+                    let vertex_buffer = self.ivars().vertex_buffer.get().unwrap();
+                    let uniform_buffer = self.ivars().uniform_buffer.get().unwrap();
+
+                    unsafe {
+                        encoder.setRenderPipelineState(pipeline_state);
+                        encoder.setVertexBuffer_offset_atIndex(Some(vertex_buffer), 0, 0);
+                        encoder.setVertexBuffer_offset_atIndex(Some(uniform_buffer), uniform_buffer_offset, 1);
+                        encoder.setFragmentBuffer_offset_atIndex(Some(uniform_buffer), uniform_buffer_offset, 1);
+                        encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType(3), 0, 3); // MTLPrimitiveTypeTriangle = 3
+                    }
+                }
 
                 // finish render pass
                 encoder.endEncoding();
@@ -873,8 +938,137 @@ fn run_metal_renderer(options: &RendererOptions) {
                 semaphore: Default::default(),
                 fps_tracker,
                 options,
+                render_pipeline_state: OnceCell::new(),
+                vertex_buffer: OnceCell::new(),
+                uniform_buffer: OnceCell::new(),
+                uniform_buffer_index: RefCell::new(0),
             });
             unsafe { msg_send![super(this), init] }
+        }
+
+        fn initialize_triangle_resources(&self, device: &ProtocolObject<dyn MTLDevice>, mtk_view: &MTKView) {
+            // Vertex data matching other renderers
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct Vertex {
+                position: [f32; 3],
+                normal: [f32; 3],
+            }
+
+            let vertices = [
+                Vertex { position: [0.0, 1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+                Vertex { position: [-1.0, -1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+                Vertex { position: [1.0, -1.0, 0.0], normal: [0.0, 0.0, 1.0] },
+            ];
+
+            // Create vertex buffer
+            let vertex_buffer_size = (vertices.len() * std::mem::size_of::<Vertex>()) as usize;
+            let vertex_buffer = device.newBufferWithLength_options(vertex_buffer_size, MTLResourceOptions::empty()).unwrap();
+
+            unsafe {
+                let contents = vertex_buffer.contents().as_ptr() as *mut Vertex;
+                std::ptr::copy_nonoverlapping(vertices.as_ptr(), contents, vertices.len());
+            }
+
+            // Create uniform buffer
+            let uniform_buffer_size = std::mem::size_of::<Uniforms>() as usize;
+            let uniform_buffer = device.newBufferWithLength_options(uniform_buffer_size * FRAMES_IN_FLIGHT, MTLResourceOptions::empty()).unwrap();
+
+            // Create shaders
+            let combined_shader_source = r#"
+                #include <metal_stdlib>
+                using namespace metal;
+
+                struct Uniforms {
+                    float4x4 view_proj;
+                    float3 light_position;
+                    float3 light_color;
+                };
+
+                struct VertexIn {
+                    float3 position [[attribute(0)]];
+                    float3 normal [[attribute(1)]];
+                };
+
+                struct VertexOut {
+                    float4 position [[position]];
+                    float3 world_position;
+                    float3 normal;
+                };
+
+                vertex VertexOut vertex_main(VertexIn in [[stage_in]],
+                                           constant Uniforms& uniforms [[buffer(1)]]) {
+                    VertexOut out;
+                    out.world_position = in.position;
+                    out.normal = in.normal;
+                    out.position = uniforms.view_proj * float4(in.position, 1.0);
+                    return out;
+                }
+
+                fragment float4 fragment_main(VertexOut in [[stage_in]],
+                                             constant Uniforms& uniforms [[buffer(1)]]) {
+                    float3 material_color = float3(1.0, 1.0, 1.0);
+                    float3 ambient = float3(0.1, 0.1, 0.1);
+
+                    float3 light_dir = normalize(uniforms.light_position - in.world_position);
+                    float3 normal = normalize(in.normal);
+
+                    float3 diffuse = max(dot(normal, light_dir), 0.0) * uniforms.light_color;
+
+                    float3 final_color = material_color * (ambient + diffuse);
+                    return float4(final_color, 1.0);
+                }
+            "#;
+
+            let library = device.newLibraryWithSource_options_error(
+                &NSString::from_str(combined_shader_source),
+                None
+            ).unwrap();
+
+            let vertex_function = library.newFunctionWithName(&NSString::from_str("vertex_main")).unwrap();
+            let fragment_function = library.newFunctionWithName(&NSString::from_str("fragment_main")).unwrap();
+
+            // Create render pipeline descriptor
+            let pipeline_descriptor = MTLRenderPipelineDescriptor::new();
+            pipeline_descriptor.setVertexFunction(Some(&vertex_function));
+            pipeline_descriptor.setFragmentFunction(Some(&fragment_function));
+
+            unsafe {
+                let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+                color_attachment.setPixelFormat(mtk_view.colorPixelFormat());
+
+                // Create vertex descriptor
+                let vertex_descriptor = MTLVertexDescriptor::new();
+                let attributes = vertex_descriptor.attributes();
+                let layouts = vertex_descriptor.layouts();
+
+                // Position attribute
+                let pos_attr = attributes.objectAtIndexedSubscript(0);
+                pos_attr.setFormat(MTLVertexFormat(30)); // MTLVertexFormatFloat3
+                pos_attr.setOffset(0);
+                pos_attr.setBufferIndex(0);
+
+                // Normal attribute
+                let norm_attr = attributes.objectAtIndexedSubscript(1);
+                norm_attr.setFormat(MTLVertexFormat(30)); // MTLVertexFormatFloat3
+                norm_attr.setOffset(12); // 3 * sizeof(float)
+                norm_attr.setBufferIndex(0);
+
+                // Layout
+                let layout = layouts.objectAtIndexedSubscript(0);
+                layout.setStride(24); // 6 * sizeof(float)
+                layout.setStepRate(1);
+                layout.setStepFunction(MTLVertexStepFunction(1)); // MTLVertexStepFunctionPerVertex
+
+                pipeline_descriptor.setVertexDescriptor(Some(&vertex_descriptor));
+            }
+
+            let render_pipeline_state = device.newRenderPipelineStateWithDescriptor_error(&pipeline_descriptor).unwrap();
+
+            // Store the resources
+            self.ivars().render_pipeline_state.set(render_pipeline_state).unwrap();
+            self.ivars().vertex_buffer.set(vertex_buffer).unwrap();
+            self.ivars().uniform_buffer.set(uniform_buffer).unwrap();
         }
     }
 
