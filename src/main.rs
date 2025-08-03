@@ -335,8 +335,13 @@ fn run_bevy_renderer(no_vsync: bool) {
 
 #[cfg(target_os = "macos")]
 fn run_metal_renderer(no_vsync: bool) {
-    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use core::cell::OnceCell;
+    use std::cell::RefCell;
 
+    use objc2::{define_class, msg_send, rc::Retained, runtime::ProtocolObject, DefinedClass, MainThreadMarker};
+
+    use objc2_app_kit::NSApplicationDelegate;
+    use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSSize};
     use objc2_metal::*;
     use objc2_metal_kit::*;
     use objc2::MainThreadOnly;
@@ -347,25 +352,127 @@ fn run_metal_renderer(no_vsync: bool) {
         event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
         window::{Window, WindowId},
     };
-    //use objc2_foundation::geometry::{CGPoint, CGRect, CGSize};
 
     use block2::RcBlock;
 
     println!("Running direct Metal renderer...");
 
+    macro_rules! idcell {
+        ($name:ident => $this:expr) => {
+            $this.ivars().$name.set($name).expect(&format!(
+                "ivar should not already be initialized: `{}`",
+                stringify!($name)
+            ));
+        };
+        ($name:ident <= $this:expr) => {
+            #[rustfmt::skip]
+            let Some($name) = $this.ivars().$name.get() else {
+                unreachable!(
+                    "ivar should be initialized: `{}`",
+                    stringify!($name)
+                )
+            };
+        };
+    }
+
+    struct Ivars {
+        command_queue: OnceCell<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
+        semaphore: OnceCell<dispatch2::DispatchRetained<dispatch2::DispatchSemaphore>>,
+        fps_tracker: RefCell<FpsTracker>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[ivars = Ivars]
+
+        struct Delegate;
+
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        unsafe impl NSApplicationDelegate for Delegate {
+            #[unsafe(method(applicationDidFinishLaunching:))]
+            #[allow(non_snake_case)]
+            unsafe fn applicationDidFinishLaunching(&self, _notification: &NSNotification) {
+
+            }
+        }
+
+        unsafe impl MTKViewDelegate for Delegate {
+            #[unsafe(method(drawInMTKView:))]
+            #[allow(non_snake_case)]
+            unsafe fn drawInMTKView(&self, mtk_view: &MTKView) {
+                idcell!(command_queue <= self);
+                idcell!(semaphore <= self);
+                let mut fps_tracker = self.ivars().fps_tracker.borrow_mut();
+
+                if semaphore.wait(dispatch2::DispatchTime::FOREVER) != 0 {
+                    panic!("Failed to wait on semaphore");
+                }
+
+                // Update FPS tracking
+                fps_tracker.update();
+
+                let Some(pass_descriptor) = (unsafe { mtk_view.currentRenderPassDescriptor() }) else {
+                    return;
+                };
+                let Some(current_drawable) = (unsafe { mtk_view.currentDrawable() }) else {
+                    return;
+                };
+                let Some(command_buffer) = command_queue.commandBuffer() else {
+                    return;
+                };
+                let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&pass_descriptor) else {
+                    return;
+                };
+
+                // Register a completion handler to signal the semaphore when done
+                let semaphore = semaphore.clone();
+                unsafe { command_buffer.addCompletedHandler(RcBlock::into_raw(RcBlock::new(move |_| {
+                    semaphore.signal();
+                }))) };
+
+                encoder.endEncoding();
+
+                // Present the drawable and commit
+                command_buffer.presentDrawable(ProtocolObject::from_ref(&*current_drawable));
+                command_buffer.commit();
+            }
+
+            #[unsafe(method(mtkView:drawableSizeWillChange:))]
+            #[allow(non_snake_case)]
+            unsafe fn mtkView_drawableSizeWillChange(&self, _view: &MTKView, _size: NSSize) {
+                // println!("mtkView_drawableSizeWillChange");
+            }
+        }
+    );
+
+    impl Delegate {
+        fn new(mtm: MainThreadMarker, device: &Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>) -> Retained<Self> {
+            let this = Self::alloc(mtm);
+            let command_queue = device.newCommandQueue().expect("Failed to create command queue");
+            let semaphore = dispatch2::DispatchSemaphore::new(3);
+            let fps_tracker = RefCell::new(FpsTracker::new("Metal Renderer"));
+
+            let this = this.set_ivars(Ivars {
+                command_queue: OnceCell::from(command_queue),
+                semaphore: OnceCell::from(semaphore),
+                fps_tracker,
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
     struct MetalApp {
         window: Option<Arc<Window>>,
         device: Option<Retained<ProtocolObject<dyn objc2_metal::MTLDevice>>>,
         view: Option<Retained<MTKView>>,
-        command_queue: Option<Retained<ProtocolObject<dyn MTLCommandQueue>>>,
-        semaphore: dispatch2::DispatchRetained<dispatch2::DispatchSemaphore>,
-        fps_tracker: FpsTracker,
+        delegate: Option<Retained<Delegate>>,
     }
 
     impl ApplicationHandler for MetalApp {
         fn resumed(&mut self, event_loop: &ActiveEventLoop) {
             let mtm = MainThreadMarker::new().expect("Not running on main thread");
-            use objc2::MainThreadMarker;
 
             let window_attributes = Window::default_attributes()
                 .with_title("Direct Metal Blank Window")
@@ -396,7 +503,6 @@ fn run_metal_renderer(no_vsync: bool) {
             let device =  objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device found");
             println!("Using Metal device: {}", device.name());
 
-            let command_queue = device.newCommandQueue().expect("failed to create command queue");
 
             let mtk_view = {
                 let frame = ns_window.frame();
@@ -404,14 +510,20 @@ fn run_metal_renderer(no_vsync: bool) {
             };
             ns_window.setContentView(Some(&mtk_view));
 
+            let delegate = Delegate::new(mtm, &device);
+            let object = ProtocolObject::from_ref(&*delegate);
+
             unsafe {
+                mtk_view.setPreferredFramesPerSecond(120); // Otherwise MTKView defaults to 60 FPS
+
+                mtk_view.setDelegate(Some(object));
                 mtk_view.setClearColor(MTLClearColor { red: 0.1, green: 0.2, blue: 0.2, alpha: 1.0 });
             }
 
             self.window = Some(window);
             self.device = Some(device);
             self.view = Some(mtk_view);
-            self.command_queue = Some(command_queue);
+            self.delegate = Some(delegate);
         }
 
         fn window_event(
@@ -426,8 +538,6 @@ fn run_metal_renderer(no_vsync: bool) {
                 WindowEvent::Resized(physical_size) => {
                     if let Some(mtk_view) = &self.view {
                         unsafe {
-                            use objc2_foundation::NSSize;
-
                             mtk_view.setFrameSize(NSSize::new(
                                 physical_size.width as f64,
                                 physical_size.height as f64,
@@ -439,69 +549,13 @@ fn run_metal_renderer(no_vsync: bool) {
             }
         }
 
-        fn new_events(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _cause: winit::event::StartCause) {
-
-
-
-
-
-            // Now pull all the events. winit will then continue in about_to_wait.
-        }
-
-        fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-            // This runs when the event loop is ready to process events. Make sure we are synced.
-            if self.semaphore.wait(dispatch2::DispatchTime::FOREVER) != 0 {
-                panic!("Failed to wait on semaphore");
-            }
-
-            // Update FPS tracking
-            self.fps_tracker.update();
-
-            let (Some(view), Some(command_queue)) = (&self.view, &self.command_queue) else {
-                return;
-            };
-
-            let Some(render_pass_descriptor) = (unsafe { view.currentRenderPassDescriptor() }) else {
-                println!("No render pass descriptor available");
-                return;
-            };
-
-
-            // Create command buffer and encoder
-            let command_buffer = command_queue.commandBuffer().expect("Failed to create command buffer");
-            let encoder = command_buffer.renderCommandEncoderWithDescriptor(&render_pass_descriptor).unwrap();
-
-            // Register a completion handler to signal the semaphore when done
-            let semaphore = self.semaphore.clone();
-            let block = RcBlock::new(move |_| {
-                semaphore.signal();
-            });
-
-
-            unsafe { command_buffer.addCompletedHandler(RcBlock::into_raw(block)) }
-
-            encoder.endEncoding();
-
-            // Present the drawable and commit
-
-            // Try to get a drawable from the Metal layer
-            if let Some(drawable) = unsafe { view.currentDrawable() } {
-                command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
-            } else {
-                panic!("Failed to get current drawable");
-            }
-            command_buffer.commit();
-
-        }
     }
 
     let mut app =  MetalApp {
         window: None,
         device: None,
         view: None,
-        command_queue: None,
-        semaphore: dispatch2::DispatchSemaphore::new(1),
-        fps_tracker: FpsTracker::new("Metal Renderer"),
+        delegate: None,
     };
 
 
