@@ -318,6 +318,26 @@ fn run_bevy_renderer(no_vsync: bool) {
         bevy::window::PresentMode::AutoVsync
     };
 
+    fn setup(
+        mut commands: Commands,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut materials: ResMut<Assets<ColorMaterial>>,
+    ) {
+        commands.spawn(Camera2d);
+
+        let triangle = meshes.add(Triangle2d::new(
+            Vec2::new(0.0, 200.0),
+            Vec2::new(-200.0, -200.0),
+            Vec2::new(200.0, -200.0),
+        ));
+
+        commands.spawn((
+            Mesh2d(triangle),
+            MeshMaterial2d(materials.add( Color::WHITE)),
+            Transform::from_xyz(0.0, 0.0, 0.0),
+        ));
+    }
+
     let mut app = App::new();
 
     app
@@ -330,7 +350,7 @@ fn run_bevy_renderer(no_vsync: bool) {
             }),
             ..default()
         }))
-        //.add_systems(Update, )
+        .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)));
 
     let render_app = (&mut app).get_sub_app_mut(RenderApp).expect("RenderApp not found");

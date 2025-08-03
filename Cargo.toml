@@ -26,6 +26,7 @@ features = [
     "bevy_winit",
     "std",
     "sysinfo_plugin",
+    "bevy_sprite",
     # Note, enabling multi-threading does cause quite a bit of extra CPU usage.
     #"multi_threaded",
 ]
