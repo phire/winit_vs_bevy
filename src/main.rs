@@ -1,6 +1,5 @@
 
 use clap::{Parser, ValueEnum};
-use eframe::egui_wgpu::WgpuConfiguration;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -301,6 +300,8 @@ fn run_raw_renderer(no_vsync: bool) {
 
 fn run_bevy_renderer(no_vsync: bool) {
     use bevy::prelude::*;
+    use bevy::render::RenderApp;
+
 
     println!("Running Bevy 0.16 renderer...");
 
@@ -317,8 +318,9 @@ fn run_bevy_renderer(no_vsync: bool) {
         bevy::window::PresentMode::AutoVsync
     };
 
-    App::new()
-        .insert_resource(BevyFpsTracker(FpsTracker::new("Bevy Renderer")))
+    let mut app = App::new();
+
+    app
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Bevy Blank Window".into(),
@@ -328,13 +330,21 @@ fn run_bevy_renderer(no_vsync: bool) {
             }),
             ..default()
         }))
-        .add_systems(Update, fps_tracking_system)
-        .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)))
-        .run();
+        //.add_systems(Update, )
+        .insert_resource(ClearColor(Color::srgb(0.1, 0.2, 0.3)));
+
+    let render_app = (&mut app).get_sub_app_mut(RenderApp).expect("RenderApp not found");
+
+    render_app
+        .insert_resource(BevyFpsTracker(FpsTracker::new("Bevy Renderer")))
+        .add_systems(ExtractSchedule, fps_tracking_system);
+
+
+    app.run();
 }
 
 #[cfg(target_os = "macos")]
-fn run_metal_renderer(no_vsync: bool) {
+fn run_metal_renderer(_no_vsync: bool) {
     // Roughly based on the example from https://docs.rs/objc2-metal/0.3.1/objc2_metal/index.html
     // Adjusted to match xcode's game template
     use core::cell::OnceCell;
@@ -522,6 +532,8 @@ fn run_metal_renderer(no_vsync: bool) {
 
 fn run_eframe_renderer(use_wgpu: bool, no_vsync: bool) {
     use eframe::egui;
+    use eframe::egui_wgpu::WgpuConfiguration;
+
 
     let backend_name = if use_wgpu { "with wgpu backend" } else { "" };
     println!("Running eframe/egui renderer {}...", backend_name);
